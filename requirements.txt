@@ -1,0 +1,7 @@
+aiohttp>=3.9.0
+feedparser>=6.0.10
+yfinance>=0.2.33
+python-dotenv>=1.0.0
+openai>=1.0.0
+python-telegram-bot>=20.0
+flask>=3.0.0
