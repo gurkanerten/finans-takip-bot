@@ -1,279 +1,306 @@
-import asyncio
-import aiohttp
+"""
+Finans Haber Botu - GERT (Hugging Face Spaces Uyumlu)
+- Hisse ve sektör bazlı analiz
+- 2 cümle kuralı
+- Health check endpoint'i
+- Telegram bildirimleri
+"""
+
 import feedparser
+import requests
+import time
+import logging
+import hashlib
 import re
 import os
-import time
-import sys
-import yfinance as yf
+import random
+import threading
+from collections import deque
+from datetime import datetime, timezone
+from openai import OpenAI
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from flask import Flask
-from threading import Thread
 
-print("=== DEBUG: kod başladı ===", file=sys.stderr, flush=True)
+# Flask için (health check)
+try:
+    from flask import Flask, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
 load_dotenv()
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-ALICI_CHAT_ID = os.environ.get("ALICI_CHAT_ID")
-HAFIZA_DOSYASI = "gonderilen_haberler.txt"
-LOG_DOSYASI = "bot_log.txt"
 
-EKONOMI_KANALLARI = {
-    "Bloomberg HT": "https://www.bloomberght.com/rss",
-    "Ekonomim": "https://www.ekonomim.com/rss",
-    "Finans Gündem": "http://www.finansgundem.com/rss",
-    "Dünya": "https://www.dunya.com/rss",
-    "Bigpara": "https://bigpara.hurriyet.com.tr/rss/",
-    "Investing TR": "https://tr.investing.com/rss/news_25.rss",
-    "Investing Kripto": "https://tr.investing.com/rss/news_301.rss",
-    "Anadolu Ajansı Ekonomi": "https://www.aa.com.tr/tr/rss/default?cat=ekonomi",
-    "Reuters Business": "https://www.reuters.com/arc/outboundfeeds/business/?outputType=xml"
+# ------------------- KONFIGURASYON -------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8829871684:AAFXcvMFaef3bbZ88Cu4VlwvVfZ7z6WgRts")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003928776122")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-da9c72499f264a8d803984e6a75de5bc")
+
+# RSS kaynaklari
+RSS_URLS = [
+    "https://news.google.com/rss/search?q=ekonomi+finans+borsa&hl=tr&gl=TR&ceid=TR:tr",
+    "https://news.google.com/rss/search?q=BIST+100&hl=tr&gl=TR&ceid=TR:tr",
+    "https://tr.investing.com/rss/news_1063.rss",
+    "https://feeds.bloomberg.com/markets/news.rss",
+    "https://www.dunya.com/rss/finans.xml",
+    "https://www.ekonomim.com/rss",
+    "https://ir.thomsonreuters.com/rss/news-releases.xml",
+]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+islenen_hashler = deque(maxlen=500)
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+# Health check için global değişkenler
+bot_running = True
+last_activity = time.time()
+
+# BIST Hisse ve Sektör Listesi (DeepSeek'e örnek olması için)
+BIST_HISSELER = {
+    "Banka": "GARAN, YKBNK, ISCTR, AKBNK, VAKBNK",
+    "Holding": "KCHOL, SAHOL",
+    "Enerji": "TUPRS, AKSEN, SASA",
+    "Demir-Çelik": "EREGL, ISDMR",
+    "Havacılık": "THYAO, PGSUS",
+    "Telekom": "TCELL, TTKOM",
+    "Gıda": "ULKER, AEFES",
+    "Perakende": "BIMAS, MGROS",
+    "İnşaat": "ENKAI, EMKEL"
 }
 
-app = Flask(__name__)
-@app.route('/')
-def home(): return "Bot Aktif!"
-def run(): app.run(host='0.0.0.0', port=7860)
-Thread(target=run, daemon=True).start()
+def haber_kaynagi(rss_url):
+    """RSS URL'sinden kaynak adini alir."""
+    if "dunya.com" in rss_url:
+        return "Dünya Gazetesi"
+    elif "ekonomim.com" in rss_url:
+        return "Ekonomim"
+    elif "news.google.com" in rss_url:
+        return "Google Haberler"
+    elif "investing.com" in rss_url:
+        return "Investing.com"
+    else:
+        return "Finans Haber"
 
-ai_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+def haber_ozeti(entry):
+    ozet = ""
+    if 'summary' in entry:
+        ozet = entry.summary
+    elif 'description' in entry:
+        ozet = entry.description
+    elif 'content' in entry and entry.content:
+        ozet = entry.content[0].value
+    else:
+        ozet = entry.title
+    ozet = re.sub(r'<[^>]+>', ' ', ozet)
+    ozet = re.sub(r'\s+', ' ', ozet).strip()
+    return ozet[:500]
 
-# --- Gerçek BIST hisseleri (BIST100) ---
-BIST100 = {
-    "THYAO","GARAN","ISCTR","AKBNK","YKBNK","SAHOL","SISE","KCHOL","ASELS","TUPRS",
-    "EREGL","BIMAS","PGSUS","TOASO","FROTO","ARCLK","TCELL","TAVHL","EKGYO","KORDS",
-    "KOZAL","SASA","HEKTS","PETKM","OYAKC","CCOLA","MGROS","VESTL","TTRAK","DOAS",
-    "AEFES","DOHOL","ULKER","IPEKE","BRISA","OTKAR","TKFEN","ALARK","MAVI","BRSAN",
-    "KONTR","KARSN","KLMSN","YATAS","CIMSA","GOZDE","BAHON","ATAGS","BUCIM","DAGHL",
-    "DMSAS","EGPRO","EUHOL","GOLTS","HALKB","HURGZ","ICBCT","IDAS","ISGYO","IZMDC",
-    "KAPLM","KARTN","KERVT","KONYA","KOZAA","KRDMD","KZBGY","LIDER","LOGO","LUKSK",
-    "MERIT","METRO","MNDRS","MSFT","NATEN","NTHOL","ODAS","ORGE","PARSN","PEKGY",
-    "PRKME","RALYH","RHEAG","RODRG","SANKO","SARKY","SELGD","SKBNK","SNKRN","SNPAM",
-    "SUMAS","TBORG","TDGYO","TEBNK","TKNSA","TLMAN","TRCAS","TRGYO","TSPOR","TUCLK",
-    "TURGG","USAK","VAKBN","VERUS","YEOTK","YESIL","YGGYO","YONGA","ZOREN"
-}
-BIST100 = {x.upper() for x in BIST100}
+def haber_hash(entry):
+    benzersiz = entry.title
+    if 'published' in entry:
+        benzersiz += entry.published
+    elif 'updated' in entry:
+        benzersiz += entry.updated
+    benzersiz += haber_ozeti(entry)[:100]
+    return hashlib.md5(benzersiz.encode('utf-8')).hexdigest()
 
-# Cache ve rate limiting
-TEMEL_VERI_CACHE = {}
-LAST_YF_CALL = 0
-YF_MIN_INTERVAL = 2  # saniye
+def haber_yeni_mi(entry, max_dakika=60):
+    if not hasattr(entry, 'published_parsed') or entry.published_parsed is None:
+        return True
+    try:
+        haber_zamani = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        simdi = datetime.now(timezone.utc)
+        fark = (simdi - haber_zamani).total_seconds() / 60
+        return fark <= max_dakika
+    except:
+        return True
 
-async def get_hisse_temel_veriler(ticker):
-    ticker = ticker.upper()
-    if ticker not in BIST100:
-        print(f"⚠️ {ticker} BIST100'de değil, atlanıyor.", flush=True)
-        return None
-    if ticker in TEMEL_VERI_CACHE:
-        return TEMEL_VERI_CACHE[ticker]
+def deepseek_hisse_analizi(baslik, ozet, kaynak):
+    """
+    DeepSeek'ten hisse ve sektör bazlı detaylı analiz alir.
+    Format:
+    📌 Konu: [Kaynak] - [Başlık]
+    🤖 Özet: [2 cümle]
+    📊 Etki: [🔴 NEGATİF / 🟢 POZİTİF / ⚪ NÖTR]
+    🎯 Hisse: [THYAO, EREGL, ...]
+    🏭 Sektör: [Banka, Enerji, Holding, ...]
+    💡 Dip Not: [2 cümle yatırımcı uyarısı]
+    """
+    ozet_kisa = ozet[:500]
     
-    global LAST_YF_CALL
-    now = time.time()
-    elapsed = now - LAST_YF_CALL
-    if elapsed < YF_MIN_INTERVAL:
-        await asyncio.sleep(YF_MIN_INTERVAL - elapsed)
-    
-    def fetch():
-        try:
-            t = yf.Ticker(f"{ticker}.IS")
-            info = t.info
-            return {
-                "mevcut_fiyat": info.get("currentPrice") or info.get("regularMarketPrice"),
-                "fk": info.get("trailingPE") if info.get("trailingPE") and info.get("trailingPE") > 0 else None,
-                "pd_dd": info.get("priceToBook") if info.get("priceToBook") and info.get("priceToBook") > 0 else None,
-                "piyasa_degeri": info.get("marketCap") if info.get("marketCap") and info.get("marketCap") > 0 else None,
-                "hisse_kodu": ticker
-            }
-        except Exception as e:
-            print(f"⚠️ Temel veri hatası ({ticker}): {e}", flush=True)
-            return None
-    
-    veri = await asyncio.to_thread(fetch)
-    LAST_YF_CALL = time.time()
-    if veri:
-        TEMEL_VERI_CACHE[ticker] = veri
-    return veri
+    prompt = f"""
+Sen bir finans uzmanısın. Aşağıdaki haberin BIST 100 piyasasına etkisini analiz et.
 
-async def get_hisse_data(ticker):
-    ticker = ticker.upper()
-    if ticker not in BIST100:
-        return "Veri yok"
-    
-    global LAST_YF_CALL
-    now = time.time()
-    elapsed = now - LAST_YF_CALL
-    if elapsed < YF_MIN_INTERVAL:
-        await asyncio.sleep(YF_MIN_INTERVAL - elapsed)
-    
-    def fetch():
-        try:
-            t = yf.Ticker(f"{ticker}.IS")
-            price = t.fast_info.last_price
-            return f"{price:.2f} TL"
-        except:
-            return "Veri yok"
-    
-    result = await asyncio.to_thread(fetch)
-    LAST_YF_CALL = time.time()
-    return result
+Haber Kaynağı: {kaynak}
+Haber Başlığı: {baslik}
+Haber Özeti: {ozet_kisa}
 
-def escape_markdown(text):
-    if not text: return ""
-    escape_chars = r'_*\[\]\(\)~`>#\+\-=|\{\}\.!'
-    return re.sub(f'([{escape_chars}])', r'\\\1', str(text))
+Görev: Bu haberin Türkiye piyasalarına etkisini hisse ve sektör bazında değerlendir.
 
-async def telegram_send_message(text, parse_mode="MarkdownV2"):
-    """Telegram'a mesaj gönder (aiohttp ile)"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": ALICI_CHAT_ID, "text": text, "parse_mode": parse_mode}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, json=payload, timeout=15) as resp:
-                result = await resp.json()
-                if result.get("ok"):
-                    print("✅ Telegram mesajı gönderildi", flush=True)
-                    return True
-                else:
-                    print(f"❌ Telegram API hatası: {result}", flush=True)
-                    return False
-        except asyncio.TimeoutError:
-            print("❌ Telegram isteği zaman aşımı (ağ veya DNS sorunu)", flush=True)
-        except Exception as e:
-            print(f"❌ Telegram isteği hatası: {type(e).__name__} - {e}", flush=True)
+ASAGIDAKI FORMATTA YANIT VER (başlıkları ve emojileri aynen kullan):
+
+📌 Konu: {kaynak} - {baslik}
+
+🤖 Özet: [EN FAZLA 2 CUMLE ile haberin piyasa etkisini açıkla. Hangi mekanizmayla etkileyeceğini belirt.]
+
+📊 Etki: [sadece BİRİNİ seç: 🔴 NEGATİF veya 🟢 POZİTİF veya ⚪ NÖTR]
+
+🎯 Hisse: [Haberde doğrudan veya dolaylı olarak etkilenmesi beklenen BIST hisse sembollerini virgülle ayırarak yaz. Örnek: THYAO, EREGL, TUPRS, GARAN, KCHOL]
+
+🏭 Sektör: [Haberde etkilenmesi beklenen sektörleri virgülle ayırarak yaz. Örnek: Banka, Enerji, Havacılık, Demir-Çelik, Holding]
+
+💡 Dip Not: [EN FAZLA 2 CUMLE ile yatırımcılara öneri. Nelere dikkat etmeleri gerektiğini belirt.]
+
+KURALLAR:
+- Özet ve Dip Not kesinlikle 2 cümleyi geçmesin.
+- Hisse ve Sektör bilgilerini mümkün olduğunca gerçekçi ve spesifik yaz.
+- Eğer haberin önemli bir etkisi yoksa veya BIST ile ilgisi yoksa sadece "Etkisiz" yaz.
+"""
+    try:
+        completion = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=450
+        )
+        yanit = completion.choices[0].message.content.strip()
+        if yanit.lower() == "etkisiz":
+            return "Etkisiz"
+        return yanit
+    except Exception as e:
+        logging.error(f"DeepSeek hatasi: {e}")
+        return "Analiz yapilamadi."
+
+def telegram_bildir(mesaj):
+    """Telegram'a mesaj gonderir"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": mesaj,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            logging.info("Telegram mesaji gonderildi.")
+            return True
+        else:
+            logging.warning(f"Telegram hatasi: {response.status_code}")
+            return False
+    except requests.exceptions.Timeout:
+        logging.warning("Telegram zaman asimi")
+        return False
+    except Exception as e:
+        logging.warning(f"Telegram baglanti hatasi: {e}")
         return False
 
-async def analiz_et(metin):
-    ticker_pattern = r'\b([A-Z]{3,4})\b'
-    bulunan = re.findall(ticker_pattern, metin.upper())
-    hisse_kodu = None
-    for aday in bulunan:
-        if aday in BIST100:
-            hisse_kodu = aday
-            break
+def test_telegram():
+    """Telegram baglantisini test eder"""
+    mesaj = "🤖 *GERT Bot Basladi*\n\nHisse ve sektor bazli analiz aktif."
+    return telegram_bildir(mesaj)
+
+# ------------------- HEALTH CHECK (FLASK) -------------------
+def start_health_check():
+    if not FLASK_AVAILABLE:
+        logging.info("Flask yok, health check devre disi.")
+        return
     
-    temel_veriler = await get_hisse_temel_veriler(hisse_kodu) if hisse_kodu else None
+    app = Flask(__name__)
     
-    prompt = (
-        "Sen profesyonel bir finans analistisin. Haberin piyasaya etkisini değerlendir (düşük/orta/yüksek).\n"
-        "Kesinlikle tahmin yapma, sadece elindeki verileri kullan.\n\n"
+    @app.route('/')
+    @app.route('/health')
+    def health():
+        global last_activity, bot_running
+        return jsonify({
+            "status": "healthy" if bot_running else "stopped",
+            "last_activity": last_activity,
+            "uptime_seconds": time.time() - last_activity
+        }), 200
+    
+    thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=7860, debug=False, use_reloader=False),
+        daemon=True
     )
-    if temel_veriler and temel_veriler.get("mevcut_fiyat"):
-        prompt += f"📊 ELDEKİ VERİLER:\n"
-        prompt += f"- Hisse: {temel_veriler['hisse_kodu']}\n"
-        prompt += f"- Fiyat: {temel_veriler['mevcut_fiyat']} TL\n"
-        prompt += f"- F/K: {temel_veriler['fk'] if temel_veriler['fk'] else 'Veri yok'}\n"
-        prompt += f"- PD/DD: {temel_veriler['pd_dd'] if temel_veriler['pd_dd'] else 'Veri yok'}\n"
-        if temel_veriler['piyasa_degeri']:
-            prompt += f"- Piyasa Değeri: {temel_veriler['piyasa_degeri']/1e9:.2f} Milyar TL\n\n"
-        else:
-            prompt += "- Piyasa Değeri: Veri yok\n\n"
-    else:
-        prompt += "⚠️ UYARI: Temel veriler çekilemedi. Sadece haber metnini değerlendir.\n\n"
+    thread.start()
+    logging.info("Health check endpoint: http://0.0.0.0:7860/health")
+
+# ------------------- ANA DONGU -------------------
+def ana_dongu():
+    global last_activity, bot_running
+    logging.info("GERT finans botu basladi (Hisse ve Sektor Bazli Analiz ile).")
     
-    prompt += (
-        "KURALLAR:\n"
-        "1. Haberin piyasaya etkisi DÜŞÜK veya hiç yoksa SADECE 'İLGİSİZ' yaz.\n"
-        "2. Etkisi ORTA veya YÜKSEK ise şu formatta yanıt ver:\n"
-        "   YÖN || ÖZET (en fazla 2 cümle) || HEDEF_FİYAT || POTANSİYEL || GEREKÇE || BIST_KODU\n"
-        "   Hedef fiyat yoksa 'Veri yok', potansiyel yoksa 'Belirsiz' yaz.\n"
-        "FORMAT: YÖN || ÖZET || HEDEF_FİYAT || POTANSİYEL || GEREKÇE || BIST_KODU\n\n"
-        f"HABER: '{metin}'"
-    )
-    try:
-        response = await ai_client.chat.completions.create(
-            model="deepseek-chat", messages=[{"role": "user", "content": prompt}],
-            temperature=0.3, timeout=30
-        )
-        cevap = response.choices[0].message.content.strip()
-        print(f"🤖 AI: {cevap[:200]}", flush=True)
-        if "İLGİSİZ" in cevap.upper() or "||" not in cevap:
-            return None
-        parts = [p.strip() for p in cevap.split("||")]
-        if len(parts) < 6:
-            return None
-        # Özeti 2 cümle ile sınırla
-        ozet = parts[1]
-        if len(ozet.split('.')) > 2:
-            parts[1] = '.'.join(ozet.split('.')[:2]) + '.'
-        return parts
-    except Exception as e:
-        print(f"❌ AI hatası: {e}", flush=True)
-        return None
-
-async def gonder(kaynak, baslik, *args, link=None):
-    for i in range(3):
-        try:
-            if len(args) < 6:
-                return
-            v = [escape_markdown(x.strip()) for x in args]
-            fiyat = await get_hisse_data(args[5].strip())
-            mesaj = (
-                f"🚨 *{escape_markdown(kaynak)}*\n\n"
-                f"📌 {escape_markdown(baslik)}\n\n"
-                f"📊 *Yön:* {v[0]}\n🤖 *Özet:* {v[1]}\n"
-                f"📈 *Fiyat:* {escape_markdown(fiyat)}\n🎯 *Hedef:* {v[2]}\n"
-                f"🚀 *Potansiyel:* {v[3]}\n💡 *Gerekçe:* {v[4]}\n"
-                f"🔗 [Detaylar]({escape_markdown(link)})"
-            )
-            success = await telegram_send_message(mesaj)
-            if success:
-                print(f"✅ Mesaj gönderildi: {baslik[:50]}", flush=True)
-                return
-        except Exception as e:
-            print(f"❌ Deneme {i+1} hatası: {e}", flush=True)
-        await asyncio.sleep(2)
-    print("❌ Mesaj gönderilemedi (tüm denemeler)", flush=True)
-
-async def test_telegram_baslangic():
-    await telegram_send_message("🤖 *Finans Takip Botu başarıyla başladı!* \n\nDüzenli olarak haberleri tarıyorum. Uygun BIST haberi geldiğinde buradan bildireceğim.")
-
-async def periyodik_canlilik_mesaji():
-    while True:
-        await asyncio.sleep(3600)
-        await telegram_send_message("🟢 *Canlılık Sinyali* - Bot hâlâ çalışıyor ve haberleri tarıyor. Uygun haber bekleniyor.")
-
-async def tarama_motoru():
-    print("🚀 Tarama motoru başlatıldı", flush=True)
-    gonderilenler = set()
-    if os.path.exists(HAFIZA_DOSYASI):
-        with open(HAFIZA_DOSYASI, "r") as f:
-            gonderilenler = set(line.strip() for line in f)
+    test_telegram()
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            print("🟢 Döngü başladı", file=sys.stderr, flush=True)
-            with open(LOG_DOSYASI, "a") as log_f:
-                log_f.write(f"{time.ctime()} - Döngü aktif\n")
-            print(f"🟢 Tarama {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    while bot_running:
+        gonderilen = 0
+        for rss_url in RSS_URLS:
+            if not bot_running:
+                break
             
-            for ad, url in EKONOMI_KANALLARI.items():
-                try:
-                    async with session.get(url, timeout=15) as resp:
-                        feed = feedparser.parse(await resp.text())
-                        for entry in feed.entries[:1]:
-                            if entry.link not in gonderilenler:
-                                print(f"📰 {ad}: {entry.title[:60]}", flush=True)
-                                res = await analiz_et(f"{entry.title}: {entry.get('summary', '')}")
-                                if res and len(res) >= 6:
-                                    await gonder(ad, entry.title, *res, link=entry.link)
-                                    gonderilenler.add(entry.link)
-                                    with open(HAFIZA_DOSYASI, "a") as f: f.write(f"{entry.link}\n")
-                                else:
-                                    print(f"   → Atlanan", flush=True)
-                            else:
-                                print(f"   → Zaten gönderilmiş", flush=True)
-                except Exception as e:
-                    print(f"❌ RSS hatası {ad}: {e}", flush=True)
-                await asyncio.sleep(2)
-            await asyncio.sleep(300)
+            try:
+                logging.info(f"Taranıyor: {rss_url}")
+                feed = feedparser.parse(rss_url)
+                
+                if feed.bozo:
+                    logging.warning(f"Feed sorunu: {rss_url}")
+                    continue
 
-async def main():
-    await test_telegram_baslangic()
-    asyncio.create_task(periyodik_canlilik_mesaji())
-    await tarama_motoru()
+                for entry in feed.entries[:3]:
+                    if not haber_yeni_mi(entry):
+                        continue
+                    
+                    h = haber_hash(entry)
+                    if h in islenen_hashler:
+                        continue
+                    islenen_hashler.append(h)
+                    
+                    kaynak = haber_kaynagi(rss_url)
+                    logging.info(f"Isleniyor: {kaynak} - {entry.title}")
+                    last_activity = time.time()
+                    
+                    analiz = deepseek_hisse_analizi(entry.title, haber_ozeti(entry), kaynak)
 
+                    if "etkisiz" in analiz.lower():
+                        logging.info(f"Etkisiz atlandi: {entry.title}")
+                        continue
+
+                    # Telegram mesajini olustur
+                    mesaj = f"🚨 *YENİ BİLDİRİM: EKONOMİ HABERİ ANALİZİ*\n\n{analiz}\n\n🔗 [Detayları Okumak İçin Tıklayınız]({entry.link})"
+                    
+                    if telegram_bildir(mesaj):
+                        gonderilen += 1
+                    
+                    time.sleep(random.uniform(3, 5))
+
+            except Exception as e:
+                logging.error(f"RSS hatasi {rss_url}: {e}")
+                continue
+        
+        last_activity = time.time()
+        logging.info(f"Tur bitti. {gonderilen} haber gonderildi. 5 dakika bekleniyor...")
+        
+        for _ in range(10):
+            if not bot_running:
+                break
+            time.sleep(30)
+            logging.debug("Health check: bot calisiyor")
+
+# ------------------- CALISTIR -------------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("GERT Finans Botu baslatiliyor... (Hisse ve Sektor Bazli Analiz)")
+    
+    start_health_check()
+    time.sleep(2)
+    
+    try:
+        ana_dongu()
+    except KeyboardInterrupt:
+        bot_running = False
+        print("\nBot durduruldu.")
+    except Exception as e:
+        bot_running = False
+        logging.critical(f"Hata: {e}")
