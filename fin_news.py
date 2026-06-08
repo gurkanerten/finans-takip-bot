@@ -1,9 +1,7 @@
 """
-Finans Haber Botu - GERT (Hugging Face Spaces Uyumlu)
-- Hisse ve sektör bazlı analiz
-- 2 cümle kuralı
-- Health check endpoint'i
-- Telegram bildirimleri
+Finans Haber Botu - GERT (Railway Uyumlu)
+- Railway'de kesintisiz çalışır
+- Health check endpoint'i ile Railway'in beklentisini karşılar
 """
 
 import feedparser
@@ -19,13 +17,7 @@ from collections import deque
 from datetime import datetime, timezone
 from openai import OpenAI
 from dotenv import load_dotenv
-
-# Flask için (health check)
-try:
-    from flask import Flask, jsonify
-    FLASK_AVAILABLE = True
-except ImportError:
-    FLASK_AVAILABLE = False
+from flask import Flask, jsonify
 
 load_dotenv()
 
@@ -38,51 +30,20 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-da9c72499f264a8d803984e6a75
 RSS_URLS = [
     "https://news.google.com/rss/search?q=ekonomi+finans+borsa&hl=tr&gl=TR&ceid=TR:tr",
     "https://news.google.com/rss/search?q=BIST+100&hl=tr&gl=TR&ceid=TR:tr",
-    "https://tr.investing.com/rss/news_1063.rss",
-    "https://feeds.bloomberg.com/markets/news.rss",
     "https://www.dunya.com/rss/finans.xml",
     "https://www.ekonomim.com/rss",
-    "https://ir.thomsonreuters.com/rss/news-releases.xml",
+    "https://tr.investing.com/rss/news_1063.rss",
 ]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 islenen_hashler = deque(maxlen=500)
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-# Health check için global değişkenler
 bot_running = True
 last_activity = time.time()
 
-# BIST Hisse ve Sektör Listesi (DeepSeek'e örnek olması için)
-BIST_HISSELER = {
-    "Banka": "GARAN, YKBNK, ISCTR, AKBNK, VAKBNK",
-    "Holding": "KCHOL, SAHOL",
-    "Enerji": "TUPRS, AKSEN, SASA",
-    "Demir-Çelik": "EREGL, ISDMR",
-    "Havacılık": "THYAO, PGSUS",
-    "Telekom": "TCELL, TTKOM",
-    "Gıda": "ULKER, AEFES",
-    "Perakende": "BIMAS, MGROS",
-    "İnşaat": "ENKAI, EMKEL"
-}
-
-def haber_kaynagi(rss_url):
-    """RSS URL'sinden kaynak adini alir."""
-    if "dunya.com" in rss_url:
-        return "Dünya Gazetesi"
-    elif "ekonomim.com" in rss_url:
-        return "Ekonomim"
-    elif "news.google.com" in rss_url:
-        return "Google Haberler"
-    elif "investing.com" in rss_url:
-        return "Investing.com"
-    else:
-        return "Finans Haber"
-
+# ------------------- YARDIMCI FONKSIYONLAR -------------------
 def haber_ozeti(entry):
     ozet = ""
     if 'summary' in entry:
@@ -117,53 +78,27 @@ def haber_yeni_mi(entry, max_dakika=60):
     except:
         return True
 
-def deepseek_hisse_analizi(baslik, ozet, kaynak):
-    """
-    DeepSeek'ten hisse ve sektör bazlı detaylı analiz alir.
-    Format:
-    📌 Konu: [Kaynak] - [Başlık]
-    🤖 Özet: [2 cümle]
-    📊 Etki: [🔴 NEGATİF / 🟢 POZİTİF / ⚪ NÖTR]
-    🎯 Hisse: [THYAO, EREGL, ...]
-    🏭 Sektör: [Banka, Enerji, Holding, ...]
-    💡 Dip Not: [2 cümle yatırımcı uyarısı]
-    """
+def deepseek_analiz(baslik, ozet):
     ozet_kisa = ozet[:500]
-    
     prompt = f"""
-Sen bir finans uzmanısın. Aşağıdaki haberin BIST 100 piyasasına etkisini analiz et.
+Haber Basligi: {baslik}
+Haber Ozeti: {ozet_kisa}
 
-Haber Kaynağı: {kaynak}
-Haber Başlığı: {baslik}
-Haber Özeti: {ozet_kisa}
+Gorev: Bu haberin Turkiye piyasalarina (BIST, doviz, faiz, sektorler) etkisini analiz et.
 
-Görev: Bu haberin Türkiye piyasalarına etkisini hisse ve sektör bazında değerlendir.
+EN FAZLA 2 CUMLE ile yanit ver:
+- "Olumlu, THYAO hissesi yukselebilir."
+- "Olumsuz, banka hisseleri baskilanabilir."
+- "Etkisiz"
 
-ASAGIDAKI FORMATTA YANIT VER (başlıkları ve emojileri aynen kullan):
-
-📌 Konu: {kaynak} - {baslik}
-
-🤖 Özet: [EN FAZLA 2 CUMLE ile haberin piyasa etkisini açıkla. Hangi mekanizmayla etkileyeceğini belirt.]
-
-📊 Etki: [sadece BİRİNİ seç: 🔴 NEGATİF veya 🟢 POZİTİF veya ⚪ NÖTR]
-
-🎯 Hisse: [Haberde doğrudan veya dolaylı olarak etkilenmesi beklenen BIST hisse sembollerini virgülle ayırarak yaz. Örnek: THYAO, EREGL, TUPRS, GARAN, KCHOL]
-
-🏭 Sektör: [Haberde etkilenmesi beklenen sektörleri virgülle ayırarak yaz. Örnek: Banka, Enerji, Havacılık, Demir-Çelik, Holding]
-
-💡 Dip Not: [EN FAZLA 2 CUMLE ile yatırımcılara öneri. Nelere dikkat etmeleri gerektiğini belirt.]
-
-KURALLAR:
-- Özet ve Dip Not kesinlikle 2 cümleyi geçmesin.
-- Hisse ve Sektör bilgilerini mümkün olduğunca gerçekçi ve spesifik yaz.
-- Eğer haberin önemli bir etkisi yoksa veya BIST ile ilgisi yoksa sadece "Etkisiz" yaz.
+Etkisi yoksa sadece "Etkisiz" yaz.
 """
     try:
         completion = client.chat.completions.create(
             model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=450
+            max_tokens=150
         )
         yanit = completion.choices[0].message.content.strip()
         if yanit.lower() == "etkisiz":
@@ -173,8 +108,8 @@ KURALLAR:
         logging.error(f"DeepSeek hatasi: {e}")
         return "Analiz yapilamadi."
 
-def telegram_bildir(mesaj):
-    """Telegram'a mesaj gonderir"""
+def telegram_bildir(mesaj, max_deneme=3):
+    """Telegram'a mesaj gonderir - gelismis yeniden deneme ile"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -183,106 +118,79 @@ def telegram_bildir(mesaj):
         "disable_web_page_preview": False
     }
     
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        if response.status_code == 200:
-            logging.info("Telegram mesaji gonderildi.")
-            return True
-        else:
-            logging.warning(f"Telegram hatasi: {response.status_code}")
-            return False
-    except requests.exceptions.Timeout:
-        logging.warning("Telegram zaman asimi")
-        return False
-    except Exception as e:
-        logging.warning(f"Telegram baglanti hatasi: {e}")
-        return False
+    for deneme in range(max_deneme):
+        try:
+            timeout = 20 + (deneme * 10)
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                logging.info(f"Telegram mesaji gonderildi")
+                return True
+            else:
+                logging.warning(f"Telegram hatasi: {response.status_code}")
+        except requests.exceptions.Timeout:
+            logging.warning(f"Deneme {deneme+1} zaman asimi ({timeout} sn)")
+        except Exception as e:
+            logging.warning(f"Deneme {deneme+1} hata: {e}")
+        
+        if deneme < max_deneme - 1:
+            time.sleep(random.uniform(5, 10))
+    
+    return False
 
-def test_telegram():
-    """Telegram baglantisini test eder"""
-    mesaj = "🤖 *GERT Bot Basladi*\n\nHisse ve sektor bazli analiz aktif."
-    return telegram_bildir(mesaj)
+# ------------------- RAILWAY HEALTH CHECK -------------------
+app = Flask(__name__)
 
-# ------------------- HEALTH CHECK (FLASK) -------------------
-def start_health_check():
-    if not FLASK_AVAILABLE:
-        logging.info("Flask yok, health check devre disi.")
-        return
-    
-    app = Flask(__name__)
-    
-    @app.route('/')
-    @app.route('/health')
-    def health():
-        global last_activity, bot_running
-        return jsonify({
-            "status": "healthy" if bot_running else "stopped",
-            "last_activity": last_activity,
-            "uptime_seconds": time.time() - last_activity
-        }), 200
-    
-    thread = threading.Thread(
-        target=lambda: app.run(host='0.0.0.0', port=7860, debug=False, use_reloader=False),
-        daemon=True
-    )
-    thread.start()
-    logging.info("Health check endpoint: http://0.0.0.0:7860/health")
+@app.route('/')
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "healthy",
+        "last_activity": last_activity,
+        "uptime_seconds": time.time() - last_activity
+    }), 200
+
+def start_web_server():
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ------------------- ANA DONGU -------------------
 def ana_dongu():
     global last_activity, bot_running
-    logging.info("GERT finans botu basladi (Hisse ve Sektor Bazli Analiz ile).")
+    logging.info("GERT finans botu basladi (Railway).")
     
-    test_telegram()
+    test_mesaj = "🤖 *GERT Bot Basladi*\n\nBot Railway'de calisiyor."
+    telegram_bildir(test_mesaj)
     
     while bot_running:
         gonderilen = 0
         for rss_url in RSS_URLS:
             if not bot_running:
                 break
-            
             try:
                 logging.info(f"Taranıyor: {rss_url}")
                 feed = feedparser.parse(rss_url)
-                
                 if feed.bozo:
-                    logging.warning(f"Feed sorunu: {rss_url}")
                     continue
-
                 for entry in feed.entries[:3]:
                     if not haber_yeni_mi(entry):
                         continue
-                    
                     h = haber_hash(entry)
                     if h in islenen_hashler:
                         continue
                     islenen_hashler.append(h)
-                    
-                    kaynak = haber_kaynagi(rss_url)
-                    logging.info(f"Isleniyor: {kaynak} - {entry.title}")
+                    logging.info(f"Isleniyor: {entry.title}")
                     last_activity = time.time()
-                    
-                    analiz = deepseek_hisse_analizi(entry.title, haber_ozeti(entry), kaynak)
-
-                    if "etkisiz" in analiz.lower():
-                        logging.info(f"Etkisiz atlandi: {entry.title}")
+                    yorum = deepseek_analiz(entry.title, haber_ozeti(entry))
+                    if "etkisiz" in yorum.lower():
                         continue
-
-                    # Telegram mesajini olustur
-                    mesaj = f"🚨 *YENİ BİLDİRİM: EKONOMİ HABERİ ANALİZİ*\n\n{analiz}\n\n🔗 [Detayları Okumak İçin Tıklayınız]({entry.link})"
-                    
+                    mesaj = f"🚨 *YENİ BİLDİRİM: EKONOMİ HABERİ ANALİZİ*\n\n📌 **{entry.title}**\n\n🤖 {yorum}\n\n🔗 [Habere Git]({entry.link})"
                     if telegram_bildir(mesaj):
                         gonderilen += 1
-                    
                     time.sleep(random.uniform(3, 5))
-
             except Exception as e:
-                logging.error(f"RSS hatasi {rss_url}: {e}")
+                logging.error(f"RSS hatasi: {e}")
                 continue
-        
-        last_activity = time.time()
-        logging.info(f"Tur bitti. {gonderilen} haber gonderildi. 5 dakika bekleniyor...")
-        
+        logging.info(f"Tur bitti. {gonderilen} haber gonderildi.")
         for _ in range(10):
             if not bot_running:
                 break
@@ -291,16 +199,12 @@ def ana_dongu():
 
 # ------------------- CALISTIR -------------------
 if __name__ == "__main__":
-    print("GERT Finans Botu baslatiliyor... (Hisse ve Sektor Bazli Analiz)")
-    
-    start_health_check()
+    print("GERT Finans Botu baslatiliyor... (Railway)")
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
     time.sleep(2)
-    
     try:
         ana_dongu()
     except KeyboardInterrupt:
         bot_running = False
         print("\nBot durduruldu.")
-    except Exception as e:
-        bot_running = False
-        logging.critical(f"Hata: {e}")
